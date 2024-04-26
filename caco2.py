@@ -20,13 +20,12 @@ import torch_geometric
 import torch_geometric.transforms as T
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import to_hetero, to_hetero_with_bases
+from torch_geometric.nn import to_hetero, to_hetero_with_bases, AttentiveFP
 import torch.nn.functional as F
 
 import networkx as nx
 import matplotlib.pyplot as plt
 
-from attentive_fp import AttentiveFP
 from molattention import MolAttention
 from heteromolattention import HeteroMolAttention
 
@@ -261,24 +260,30 @@ def train_homog(
             _ = model(data.x, data.edge_index, data.batch)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
-    model.train()
 
     num_epochs = 10
     for epoch in range(0, num_epochs):
+        model.train()
         for batch in train_loader:
             optimizer.zero_grad()
             out = model(batch.x, batch.edge_index, batch.batch)
             loss = F.mse_loss(out, batch.y)
             loss.backward()
             optimizer.step()
-        print(f"Epoch {epoch} \t Loss: {loss}")
+            
+        model.eval()
+        with torch.no_grad():
+            for batch in valid_loader:
+                out = model(batch.x, batch.edge_index, batch.batch)
+                valid_loss = F.mse_loss(out, batch.y)
+       
+        print(f"Epoch {epoch} \t Train Loss: {loss:.3g} \t Valid Loss {valid_loss:.3g}")
 
     return model
 
 def train_hetero(
     train_loader: DataLoader,
     valid_loader: DataLoader,
-    model_name: Literal["attentivefp", "molattention"] = "attentivefp",
 ) -> torch.nn.Module:
     """Train the attentive fp model
 
@@ -402,7 +407,7 @@ if __name__ == "__main__":
         model = train_homog(train_loader, valid_loader, model_name="attentivefp")
     else:
         if INCLUDE_FEATURES:
-            model = train_hetero(train_loader, valid_loader, model_name="molattention")
+            model = train_hetero(train_loader, valid_loader)
             hetero = True
         else:
             model = train_homog(train_loader, valid_loader, model_name="molattention")
