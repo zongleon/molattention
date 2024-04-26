@@ -2,10 +2,16 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from torch_geometric.nn import GATConv, global_add_pool, Linear
+from torch_geometric.nn import (
+    GATConv,
+    global_add_pool,
+    Linear,
+    HeteroConv,
+    HeteroDictLinear,
+)
 
 
-class MolAttention(torch.nn.Module):
+class HeteroMolAttention(torch.nn.Module):
     """A modified Grpah Attention model based on:
     `"Pushing the Boundaries of Molecular Representation for Drug Discovery
     with the Graph Attention Mechanism"
@@ -24,8 +30,11 @@ class MolAttention(torch.nn.Module):
 
     def __init__(
         self,
+        node_types: list[str],
+        edge_types: list[tuple[str, str, str]],
         hidden_channels: int,
         out_channels: int,
+        num_heads: int,
         num_layers: int,
         dropout: float = 0.0,
     ):
@@ -36,34 +45,34 @@ class MolAttention(torch.nn.Module):
         self.num_layers = num_layers
         self.dropout = dropout
 
-        self.lin1 = Linear(-1, hidden_channels)
-
-        self.gat_conv = GATConv(
-            hidden_channels,
-            hidden_channels,
-            dropout=dropout,
-            add_self_loops=False,
-            negative_slope=0.01,
-        )
+        self.lin1 = HeteroDictLinear(-1, hidden_channels, types=node_types)
 
         self.atom_gats = torch.nn.ModuleList()
         for _ in range(num_layers - 1):
-            conv = GATConv(
-                hidden_channels,
-                hidden_channels,
-                dropout=dropout,
-                add_self_loops=False,
-                negative_slope=0.01,
+            conv = HeteroConv(
+                {
+                    edge: GATConv(
+                        (-1, -1),
+                        hidden_channels,
+                        dropout=dropout,
+                        heads=num_heads,
+                        add_self_loops=False,
+                        negative_slope=0.01,
+                    )
+                    for edge in edge_types
+                },
+                aggr="sum",
             )
             self.atom_gats.append(conv)
 
         self.mol_conv = GATConv(
-            hidden_channels,
+            (-1, -1),
             hidden_channels,
             dropout=dropout,
             add_self_loops=False,
             negative_slope=0.01,
         )
+
         self.mol_conv.explain = False  # Cannot explain global pooling.
 
         self.lin2 = Linear(hidden_channels, out_channels)
@@ -73,32 +82,32 @@ class MolAttention(torch.nn.Module):
     def reset_parameters(self):
         r"""Resets all learnable parameters of the module."""
         self.lin1.reset_parameters()
-        self.gat_conv.reset_parameters()
         for gat in self.atom_gats:
             gat.reset_parameters()
         self.mol_conv.reset_parameters()
         self.lin2.reset_parameters()
 
-    def forward(self, x: Tensor, edge_index: Tensor, batch: Tensor) -> Tensor:
+    def forward(self, x_dict, edge_index_dict, batch) -> Tensor:
         """"""
         # Atom Embedding:
-        x = F.leaky_relu_(self.lin1(x))
-
-        h = F.elu_(self.gat_conv(x, edge_index))
-        x = F.dropout(h, p=self.dropout, training=self.training)
+        x_dict = self.lin1(x_dict)
+        x_dict = {key: F.leaky_relu_(x) for key, x in x_dict.items()}
 
         for gat in self.atom_gats:
-            h = gat(x, edge_index)
-            h = F.elu(h)
-            x = F.dropout(h, p=self.dropout, training=self.training)
+            h_dict = gat(x_dict, edge_index_dict)
+            h_dict = {key: F.elu_(x) for key, x in h_dict.items()}
+            x_dict = {
+                key: F.dropout(x, p=self.dropout, training=self.training)
+                for key, x in h_dict.items()
+            }
 
         # Molecule Embedding:
         row = torch.arange(batch.size(0), device=batch.device)
         edge_index = torch.stack([row, batch], dim=0)
 
-        out = global_add_pool(x, batch).relu_()
+        out = global_add_pool(x_dict["molecule"], batch).relu_()
 
-        h = F.elu_(self.mol_conv((x, out), edge_index))
+        h = F.elu_(self.mol_conv((x_dict["molecule"], out), edge_index))
         out = F.dropout(h, p=self.dropout, training=self.training)
 
         # Predictor:

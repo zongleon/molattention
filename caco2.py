@@ -1,4 +1,4 @@
-from typing import Union, cast
+from typing import Union, Literal, cast
 from tdc.single_pred import ADME
 from tdc.chem_utils import MolConvert
 from tdc import Evaluator
@@ -12,6 +12,7 @@ from rdkit.Chem.Draw import rdMolDraw2D
 import os
 import numpy as np
 import pandas as pd
+from pandas.api.types import CategoricalDtype
 from tqdm import tqdm
 
 import torch
@@ -19,7 +20,7 @@ import torch_geometric
 import torch_geometric.transforms as T
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import to_hetero
+from torch_geometric.nn import to_hetero, to_hetero_with_bases
 import torch.nn.functional as F
 
 import networkx as nx
@@ -27,6 +28,7 @@ import matplotlib.pyplot as plt
 
 from attentive_fp import AttentiveFP
 from molattention import MolAttention
+from heteromolattention import HeteroMolAttention
 
 
 def get_features_from_data(
@@ -162,7 +164,7 @@ def draw_rdkit(smiles: str, name: str) -> None:
     d.WriteDrawingText(name)
 
 
-def hash_types(types: list[str]) -> dict[str, int]:
+def hash_types(types: list[str], hash: dict[str, int] | None) -> dict[str, int]:
     """Hash a list of features/functional groups to numeric codes
 
     Args:
@@ -171,8 +173,12 @@ def hash_types(types: list[str]) -> dict[str, int]:
     Returns:
         dict[str, int]: Hash from types to codes
     """
-    category = pd.Series(types).astype("category")
+    if hash is None:
+        category = pd.Series(types).astype("category")
+        return dict(zip(types, category.cat.codes))
 
+    cat_type = CategoricalDtype(categories=list(hash.keys()), ordered=True)
+    category = pd.Series(types).astype(cat_type)
     return dict(zip(types, category.cat.codes))
 
 
@@ -197,7 +203,7 @@ def add_features_to_pyg(
         feat_nodes[feat_idx, feat_hashed] = 1
 
         for node in feature.GetAtomIds():
-            edges.append((node, feat_hashed))
+            edges.append((node, feat_idx))
 
     new_edges = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
@@ -219,7 +225,11 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def train_homog(train: pd.DataFrame, valid: pd.DataFrame, model_name: str = "attentivefp") -> torch.nn.Module:
+def train_homog(
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    model_name: Literal["attentivefp", "molattention"] = "attentivefp",
+) -> torch.nn.Module:
     """Train the attentive fp model
 
     Args:
@@ -242,16 +252,18 @@ def train_homog(train: pd.DataFrame, valid: pd.DataFrame, model_name: str = "att
         model = MolAttention(
             hidden_channels=64,
             out_channels=1,
-            edge_dim=1,
             num_layers=1,
-            num_heads=1,
-            dropout=0.0
+            dropout=0.0,
         )
-    
+        with torch.no_grad():
+            data = next(iter(train_loader))
+            print(data)
+            _ = model(data.x, data.edge_index, data.batch)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
     model.train()
 
-    num_epochs = 30
+    num_epochs = 10
     for epoch in range(0, num_epochs):
         for batch in train_loader:
             optimizer.zero_grad()
@@ -263,33 +275,88 @@ def train_homog(train: pd.DataFrame, valid: pd.DataFrame, model_name: str = "att
 
     return model
 
+def train_hetero(
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    model_name: Literal["attentivefp", "molattention"] = "attentivefp",
+) -> torch.nn.Module:
+    """Train the attentive fp model
 
-def eval_model(model: torch.nn.Module, test_graphs: list):
+    Args:
+        train (pd.DataFrame): train dataset
+        valid (pd.DataFrame): valid dataset
+
+    Returns:
+        torch.nn.Module: model
+    """
+    node_types = ["molecule", "feature"]
+    edge_types = [
+        ("molecule", "conn", "molecule"),
+        ("molecule", "part", "feature"),
+        ("feature", "rev_part", "molecule"),
+    ]
+    model = HeteroMolAttention(
+        node_types=node_types,
+        edge_types=edge_types,
+        hidden_channels=64,
+        num_heads=2,
+        out_channels=1,
+        num_layers=2,
+        dropout=0.0,
+    )
+    
+    # Lazy loading
+    with torch.no_grad():
+        data = next(iter(train_loader))
+        _ = model(data.x_dict, data.edge_index_dict, data["molecule"].batch)
+        
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=5e-4)
+
+    num_epochs = 30
+    for epoch in range(0, num_epochs):
+        # train
+        model.train()
+        for batch in train_loader:
+            optimizer.zero_grad()
+            out = model(batch.x_dict, batch.edge_index_dict, batch["molecule"].batch)
+            loss = F.mse_loss(out, batch.y)
+            loss.backward()
+            optimizer.step()
+
+        # valid
+        model.eval()
+        with torch.no_grad():
+            for batch in valid_loader:
+                out = model(batch.x_dict, batch.edge_index_dict, batch["molecule"].batch)
+                valid_loss = F.mse_loss(out, batch.y)
+       
+        print(f"Epoch {epoch} \t Train Loss: {loss:.3g} \t Valid Loss {valid_loss:.3g}")
+
+    return model
+
+def eval_model(model: torch.nn.Module, test_loader: DataLoader, test_df: pd.DataFrame, hetero=False):
     """Evaluate model on test dataset
 
     Args:
         model (torch.nn.Module): Trained model
         test_graphs (list): Processed test graphs
     """
+    evaluator = Evaluator(name="mse")
     model.eval()
     with torch.no_grad():
         preds = []
         for batch in test_loader:
-            if INCLUDE_FEATURES:
-                batch_dict = {x: batch[x].batch for x in ["molecule", "feature"]}
-                out = model(batch.x_dict, batch.edge_index_dict, batch_dict)
+            if hetero:
+                pred = model(batch.x_dict, batch.edge_index_dict, batch["molecule"].batch)
             else:
                 pred = model(batch.x, batch.edge_index, batch.batch)
             preds += pred.tolist()
-        score = mean_absolute_error(test["Y"], preds)
-        evaluator = Evaluator(name = 'MSE')
-        # y_true: [0.8, 0.7, ...]; y_pred: [0.75, 0.73, ...]
-        score = evaluator(y_true, y_pred)
+        
+        score = evaluator(test_df["Y"], preds)
+        print(f"MSE: {score:.3g}")
 
-        print(score)
-
-    print(count_parameters(model))
-
+    print(f"Parameters: {count_parameters(model)}")
 
 
 if __name__ == "__main__":
@@ -311,32 +378,33 @@ if __name__ == "__main__":
     graphs = []
     tx = T.ToUndirected()
     for df in [train, val, test]:
-        df = convert_smiles_pyg(df)
+        converted = convert_smiles_pyg(df)
 
         if INCLUDE_FEATURES:
-            if types is None:
-                feats, types = get_features_from_data(df)
-                types = hash_types(list(types.keys()))
-            feats, _ = get_features_from_data(df)
+            feats, types = get_features_from_data(df)
+            types = hash_types(list(types.keys()), types)
 
-            for idx, (graph, feat_list) in enumerate(zip(df, feats)):
+            for idx, (graph, feat_list) in enumerate(zip(converted, feats)):
                 g = add_features_to_pyg(graph, types, feat_list)
-                df[idx] = tx(g)
+                converted[idx] = tx(g)
 
-    
+        graphs.append(converted)
+
     graphs[0] = add_label_pyg(graphs[0], train["Y"].tolist())
+    graphs[1] = add_label_pyg(graphs[1], val["Y"].tolist())
 
     train_loader = DataLoader(graphs[0], batch_size=32)
+    valid_loader = DataLoader(graphs[1], batch_size=32)
     test_loader = DataLoader(graphs[2], batch_size=32)
 
+    hetero = False
     if ATTENTIVE_FP:
-        model = train_homog(graphs[0], graphs[1], model_name="attentivefp")
-    else:    
+        model = train_homog(train_loader, valid_loader, model_name="attentivefp")
+    else:
         if INCLUDE_FEATURES:
-            pass
+            model = train_hetero(train_loader, valid_loader, model_name="molattention")
+            hetero = True
         else:
-            pass
-    
+            model = train_homog(train_loader, valid_loader, model_name="molattention")
 
-    eval_model(model, test_loader)
-
+    eval_model(model, test_loader, test, hetero)
